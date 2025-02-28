@@ -1,0 +1,368 @@
+from __future__ import annotations
+
+import asyncio
+import inspect
+from datetime import datetime
+from enum import Enum
+from functools import wraps
+from typing import (
+    Any, Callable, Dict, Generic, List, Optional, 
+    Protocol, TypeVar, Union, runtime_checkable
+)
+from uuid import UUID, uuid4
+import sqlite3
+import json
+from pathlib import Path
+
+from loguru import logger
+from pydantic import BaseModel, Field, validator
+from pydantic.generics import GenericModel
+from rich.progress import Progress
+
+# Type definitions
+T = TypeVar('T')
+JobResult = TypeVar('JobResult')
+
+@runtime_checkable
+class Executable(Protocol):
+    """Protocol for job execution"""
+    async def execute(self) -> Any: ...
+
+class JobStatus(str, Enum):
+    """Job execution states"""
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    SCHEDULED = "scheduled"
+
+class Priority(int, Enum):
+    """Job priority levels"""
+    LOW = 0
+    MEDIUM = 1
+    HIGH = 2
+    CRITICAL = 3
+
+class JobMetrics(BaseModel):
+    """Job execution metrics"""
+    start_time: float = Field(default_factory=lambda: datetime.now().timestamp())
+    end_time: Optional[float] = None
+    duration: Optional[float] = None
+    memory_peak: Optional[float] = None
+    error_count: int = 0
+    retries: int = 0
+
+    def complete(self) -> None:
+        """Record job completion metrics"""
+        self.end_time = datetime.now().timestamp()
+        self.duration = self.end_time - self.start_time
+
+    class Config:
+        frozen = True
+
+class JobConfig(BaseModel):
+    """Job configuration settings"""
+    max_retries: int = 3
+    retry_delay: float = 1.0
+    timeout: Optional[float] = None
+    priority: Priority = Priority.MEDIUM
+    
+    @validator('max_retries')
+    def validate_retries(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("max_retries cannot be negative")
+        return v
+
+    class Config:
+        frozen = True
+
+class Job(GenericModel, Generic[JobResult]):
+    """Core job representation"""
+    id: UUID = Field(default_factory=uuid4)
+    name: str
+    status: JobStatus = JobStatus.PENDING
+    created_at: datetime = Field(default_factory=datetime.now)
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    result: Optional[JobResult] = None
+    error: Optional[str] = None
+    metrics: JobMetrics = Field(default_factory=JobMetrics)
+    config: JobConfig = Field(default_factory=JobConfig)
+    # Added for client-server communication
+    func_name: Optional[str] = None
+    args: tuple = ()
+    kwargs: dict = {}
+
+    class Config:
+        frozen = True
+
+    def evolve(self, **changes: Any) -> Job[JobResult]:
+        """Create a new job instance with updates"""
+        return self.copy(update=changes)
+
+class SqliteJobStore:
+    """SQLite-based job storage implementation"""
+    def __init__(self, db_path: str = "jobs.db"):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id TEXT PRIMARY KEY,
+                    data TEXT NOT NULL
+                )
+            """)
+
+    async def save(self, job: Job) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO jobs (id, data) VALUES (?, ?)",
+                (str(job.id), job.json())
+            )
+
+    async def get(self, job_id: UUID) -> Optional[Job]:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT data FROM jobs WHERE id = ?", 
+                (str(job_id),)
+            ).fetchone()
+            if row:
+                return Job.parse_raw(row[0])
+        return None
+
+    async def list_active(self) -> List[Job]:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT data FROM jobs WHERE json_extract(data, '$.status') IN (?, ?)",
+                (JobStatus.PENDING.value, JobStatus.RUNNING.value)
+            ).fetchall()
+            return [Job.parse_raw(row[0]) for row in rows]
+
+    async def list_all(self) -> List[Job]:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute("SELECT data FROM jobs").fetchall()
+            return [Job.parse_raw(row[0]) for row in rows]
+
+    async def update(self, job: Job) -> None:
+        await self.save(job)
+
+class JobExecutor:
+    """Handles job execution and lifecycle"""
+    def __init__(self, store: SqliteJobStore):
+        self.store = store
+        self._running: Dict[UUID, asyncio.Task] = {}
+
+    async def execute(self, job: Job[JobResult], func: Callable[..., JobResult], 
+                     *args: Any, **kwargs: Any) -> Job[JobResult]:
+        """Execute a job with retry logic and metrics"""
+        retries = 0
+        last_error = None
+
+        while retries <= job.config.max_retries:
+            try:
+                if retries > 0:
+                    await asyncio.sleep(job.config.retry_delay * retries)
+
+                job = job.evolve(
+                    status=JobStatus.RUNNING,
+                    started_at=datetime.now(),
+                    metrics=JobMetrics(retries=retries)
+                )
+                await self.store.update(job)
+
+                if inspect.iscoroutinefunction(func):
+                    result = await func(*args, **kwargs)
+                else:
+                    result = await asyncio.to_thread(func, *args, **kwargs)
+
+                job = job.evolve(
+                    status=JobStatus.COMPLETED,
+                    completed_at=datetime.now(),
+                    result=result,
+                    metrics=job.metrics.copy(update={'end_time': datetime.now().timestamp()})
+                )
+                await self.store.update(job)
+                return job
+
+            except Exception as e:
+                last_error = str(e)
+                retries += 1
+                logger.error(f"Job {job.id} failed: {e}")
+
+        job = job.evolve(
+            status=JobStatus.FAILED,
+            completed_at=datetime.now(),
+            error=last_error,
+            metrics=job.metrics.copy(update={
+                'error_count': retries,
+                'end_time': datetime.now().timestamp()
+            })
+        )
+        await self.store.update(job)
+        return job
+
+class JobQueue:
+    """Main job queue interface with client-server support"""
+    def __init__(self, db_path: str = "jobs.db", is_server: bool = False):
+        self.store = SqliteJobStore(db_path)
+        self.executor = JobExecutor(self.store)
+        self._queue: asyncio.PriorityQueue[tuple[int, Job]] = asyncio.PriorityQueue()
+        self._worker_task: Optional[asyncio.Task] = None
+        self.is_server = is_server
+
+    async def submit(
+        self, 
+        func: Optional[Callable[..., JobResult]] = None,
+        *args: Any, 
+        name: Optional[str] = None,
+        config: Optional[JobConfig] = None,
+        **kwargs: Any
+    ) -> Job[JobResult]:
+        """Submit a new job to the queue"""
+        if self.is_server and not func:
+            raise ValueError("Server mode requires a function")
+
+        job = Job(
+            name=name or (func.__name__ if func else "remote_job"),
+            config=config or JobConfig(),
+            func_name=func.__module__ + "." + func.__name__ if func else None,
+            args=args,
+            kwargs=kwargs
+        )
+        
+        await self.store.save(job)
+        if self.is_server:
+            await self._queue.put((-job.config.priority.value, job))
+            
+            if not self._worker_task or self._worker_task.done():
+                self._worker_task = asyncio.create_task(self._worker())
+        
+        return job
+
+    async def _worker(self) -> None:
+        """Process jobs from the queue"""
+        while True:
+            try:
+                _, job = await self._queue.get()
+                if job.status == JobStatus.CANCELLED:
+                    continue
+
+                if job.func_name:
+                    module_name, func_name = job.func_name.rsplit('.', 1)
+                    module = __import__(module_name, fromlist=[func_name])
+                    func = getattr(module, func_name)
+                    
+                    self._worker_task = asyncio.create_task(
+                        self.executor.execute(job, func, *job.args, **job.kwargs)
+                    )
+                    await self._worker_task
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Worker error: {e}")
+            finally:
+                self._queue.task_done()
+
+    # Client methods
+    async def get_status(self, job_id: UUID) -> Optional[JobStatus]:
+        """Get current job status"""
+        job = await self.store.get(job_id)
+        return job.status if job else None
+
+    async def get_result(self, job_id: UUID) -> Optional[JobResult]:
+        """Get job result if completed"""
+        job = await self.store.get(job_id)
+        return job.result if job and job.status == JobStatus.COMPLETED else None
+
+    async def cancel(self, job_id: UUID) -> bool:
+        """Cancel a pending or running job"""
+        job = await self.store.get(job_id)
+        if not job:
+            return False
+
+        if job.status in (JobStatus.PENDING, JobStatus.RUNNING):
+            job = job.evolve(
+                status=JobStatus.CANCELLED,
+                completed_at=datetime.now()
+            )
+            await self.store.update(job)
+            return True
+        return False
+
+    async def list_jobs(self) -> List[Job]:
+        """List all jobs"""
+        return await self.store.list_all()
+
+    async def list_active_jobs(self) -> List[Job]:
+        """List active jobs"""
+        return await self.store.list_active()
+
+    async def wait_for_job(
+        self, 
+        job_id: UUID, 
+        timeout: Optional[float] = None,
+        poll_interval: float = 0.1
+    ) -> Job:
+        """Wait for job completion with optional timeout"""
+        start_time = datetime.now()
+        while True:
+            job = await self.store.get(job_id)
+            if not job:
+                raise ValueError(f"Job {job_id} not found")
+                
+            if job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
+                return job
+                
+            if timeout and (datetime.now() - start_time).total_seconds() > timeout:
+                raise TimeoutError(f"Timeout waiting for job {job_id}")
+                
+            await asyncio.sleep(poll_interval)
+
+# Example usage
+async def example():
+    # Start server
+    server_queue = JobQueue(db_path="jobs.db", is_server=True)
+
+    # Create client
+    client_queue = JobQueue(db_path="jobs.db", is_server=False)
+
+    # Define a job
+    async def process_data(data: List[int]) -> Dict[str, Any]:
+        await asyncio.sleep(1)  # Simulate work
+        return {
+            "sum": sum(data),
+            "avg": sum(data) / len(data),
+            "count": len(data)
+        }
+
+    # Submit job from client
+    job = await client_queue.submit(
+        process_data,
+        [1, 2, 3, 4, 5],
+        name="data_processing",
+        config=JobConfig(priority=Priority.HIGH)
+    )
+    
+    # Monitor with progress bar
+    with Progress() as progress:
+        task = progress.add_task(f"Processing {job.name}...", total=None)
+        
+        try:
+            job = await client_queue.wait_for_job(job.id, timeout=30)
+            progress.update(task, completed=True)
+            
+            if job.status == JobStatus.COMPLETED:
+                logger.info(f"Job completed: {job.result}")
+            else:
+                logger.error(f"Job failed: {job.error}")
+                
+        except TimeoutError:
+            logger.error("Job timed out")
+
+if __name__ == "__main__":
+    logger.add("jobs.log", rotation="500 MB")
+    asyncio.run(example())
