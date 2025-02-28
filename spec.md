@@ -147,18 +147,47 @@ Se reconocen los siguientes niveles a desarrollar.
 
 #### 4.1 API Externa (OpenAPI)
 Se recomienda en este punto analizar la API de Open API para fine tuning.
-- **`/fine_tuning/jobs`**:
-  - `POST /create`: `{ "base_model": str, "dataset": str, "hyperparameters": dict, "output_model": str }` → `{ "job_id": str }`.
-  - `GET /list`: `[ { "job_id": str, "status": "pending|running|succeeded|failed|cancelled", "created_at": datetime } ]`.
-- **`/fine_tuning/jobs/{job_id}`**:
-  - `GET /`: `{ "job_id": str, "status": str, "progress": float, "metrics": dict, "result": dict }`.
-  - `POST /cancel`: Cancela el trabajo.
-  - `GET /checkpoints`: `[ { "id": str, "step": int, "metrics": dict } ]`.
-  - `GET /events`: `[ { "id": str, "level": "info|error", "message": str } ]`.
-- **`/deployment/model`**:
-  - `POST /deploy`: `{ "model_id": str, "adapters": [str] }` → `{ "deployment_id": str }`.
-  - `GET /{model_id}`: `{ "deployment_id": str, "status": str }`.
-  - `POST /undeploy`: Termina el despliegue.
+Datasets
+
+# SDK API Endpoints
+
+## Authentication
+- All endpoints require an API key via.
+
+## Health Check
+- `GET /health` - Check API health status
+
+## Datasets
+- `GET /datasets` - List all available datasets
+- `GET /datasets/{name}` - Get dataset by name
+- `POST /datasets` - Create a new dataset
+- `DELETE /datasets/{name}` - Delete dataset by name
+
+## Models
+- `GET /models` - List all available models
+- `GET /models/{name}` - Get model by name
+- `POST /models` - Create a new model
+- `DELETE /models/{name}` - Delete model by name
+
+## Adapters
+- `GET /adapters` - List all available adapters
+- `GET /adapters/{name}` - Get adapter by name
+- `POST /adapters` - Create a new adapter
+- `DELETE /adapters/{name}` - Delete adapter by name
+
+## Fine-Tuning Jobs
+- `POST /fine_tuning/jobs` - Create a new fine-tuning job
+- `GET /fine_tuning/jobs` - List all fine-tuning jobs
+- `GET /fine_tuning/jobs/{job_name}` - Get a fine-tuning job by name
+- `DELETE /fine_tuning/jobs/{job_name}` - Cancel a fine-tuning job
+- `POST /fine_tuning/jobs/{job_name}/pause` - Pause a fine-tuning job
+- `POST /fine_tuning/jobs/{job_name}/resume` - Resume a fine-tuning job
+
+## Deployments
+- `GET /deployments` - List all active deployments
+- `POST /deployments` - Create a new deployment
+- `GET /deployments/{name}` - Get deployment by name
+- `DELETE /deployments/{name}` - Deactivate and remove a deployment
 
 #### 4.2 SDK (Línea de Comandos)
 
@@ -331,7 +360,7 @@ classDiagram
 ```
 
 
-**Diagrama de API de prueba**:
+**Diagrama de implementación de referencia**:
 ```mermaid
 graph TD
     A[Dataset] -->|used by| B[Model]
