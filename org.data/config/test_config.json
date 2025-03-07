@@ -1,0 +1,40 @@
+{
+  "dataset": {
+    "format": "alpaca",
+    "path": "fine_tuning_data/alpaca.jsonl",
+    "train_split": "train",
+    "val_split": "validation"
+  },
+  "model": {
+    "model_name_path": "ComCom/gpt2-small",
+    "max_length": 512,
+    "padding_side": "right",
+    "device_map": "auto"
+  },
+  "training": {
+    "method": "lora",
+    "output_dir": "./lora_output",
+    "num_train_epochs": 3,
+    "per_device_train_batch_size": 4,
+    "per_device_eval_batch_size": 4,
+    "gradient_accumulation_steps": 8,
+    "learning_rate": 5e-05,
+    "weight_decay": 0.01,
+    "warmup_ratio": 0.03,
+    "lr_scheduler_type": "cosine",
+    "save_strategy": "epoch",
+    "save_total_limit": 2,
+    "evaluation_strategy": "epoch",
+    "fp16": true,
+    "optim": "adamw_torch",
+    "lora": {
+      "r": 16,
+      "lora_alpha": 32,
+      "lora_dropout": 0.05,
+      "bias": "none",
+      "target_modules": [
+        "c_attn"
+      ]
+    }
+  }
+}

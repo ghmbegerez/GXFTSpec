@@ -1,0 +1,45 @@
+dataset:
+  format: "alpaca"
+  path: "fine_tuning_data/alpaca.jsonl"  # Path to the dataset
+  train_split: "train"
+  val_split: "validation"
+  input_column: "instruction"
+  output_column: "output"
+  text_column: "text"
+
+model:
+  _model_name_or_path: "meta-llama/Llama-2-7b-hf"  # Model identifier
+  max_length: 2048
+  padding_side: "right"
+  device_map: "auto"
+
+training:
+  method: "qlora"
+  output_dir: "./qlora_output"
+  num_train_epochs: 3
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  lr_scheduler_type: "cosine"
+  save_strategy: "epoch"
+  save_total_limit: 2
+  evaluation_strategy: "epoch"
+  fp16: true
+  gradient_checkpointing: true
+  
+  # LoRA parameters
+  lora:
+    r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    bias: "none"
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+  
+  # QLoRA parameters
+  qlora:
+    load_in_4bit: true
+    bnb_4bit_use_double_quant: true
+    bnb_4bit_quant_type: "nf4"

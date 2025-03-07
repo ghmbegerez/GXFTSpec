@@ -363,6 +363,80 @@ async def example():
         except TimeoutError:
             logger.error("Job timed out")
 
+# FineTuner job implementation
+async def run_finetuner_job(config_path: str, job_id: Optional[str] = None) -> Dict[str, Any]:
+    """Run a fine-tuning job using FineTuner"""
+    from sdk.finetuner import FineTuner
+    import json
+    import os
+    import datetime
+    
+    try:
+        # Load configuration
+        with open(config_path, 'r') as f:
+            if config_path.endswith('.yaml') or config_path.endswith('.yml'):
+                import yaml
+                config_dict = yaml.safe_load(f)
+            else:
+                config_dict = json.load(f)
+        
+        # Initialize the FineTuner
+        fine_tuner = FineTuner(config_dict, job_id=job_id)
+        logger.info(f"Starting fine-tuning job: {fine_tuner.job_id}")
+        
+        # Run training
+        results = fine_tuner.train()
+        
+        # Save model
+        save_path = fine_tuner.save_model()
+        
+        # Create summary
+        summary = {
+            "job_id": fine_tuner.job_id,
+            "dataset": fine_tuner.config.dataset.path,
+            "model": fine_tuner.config.model.model_name_path,
+            "method": fine_tuner.config.training.method,
+            "output_model_path": save_path,
+            "timestamp": datetime.datetime.now().isoformat(),
+            "status": "completed"
+        }
+        
+        # Add training metrics
+        if hasattr(results, 'metrics'):
+            summary["training_loss"] = results.training_loss
+            summary["training_steps"] = results.global_step
+        
+        # Evaluate the model if validation dataset is available
+        if fine_tuner.val_dataset:
+            logger.info(f"Running evaluation for job: {fine_tuner.job_id}")
+            eval_results = fine_tuner.evaluate()
+            if eval_results:
+                summary["eval_loss"] = eval_results['eval_loss']
+        
+        # Save the job summary
+        summary_path = os.path.join(fine_tuner.job_dir, "job_summary.json")
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+            
+        logger.info(f"Fine-tuning job completed successfully: {fine_tuner.job_id}")
+        return summary
+        
+    except Exception as e:
+        logger.error(f"Error in fine-tuning job: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise
+
+class FineTunerJob:
+    """Job wrapper for running FineTuner jobs in the queue system"""
+    def __init__(self, config_path: str, job_id: Optional[str] = None):
+        self.config_path = config_path
+        self.job_id = job_id
+    
+    async def execute(self) -> Dict[str, Any]:
+        """Execute the fine-tuning job"""
+        return await run_finetuner_job(self.config_path, self.job_id)
+
 if __name__ == "__main__":
     logger.add("jobs.log", rotation="500 MB")
     asyncio.run(example())

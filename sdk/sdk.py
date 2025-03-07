@@ -1,561 +1,723 @@
-from managers import FineTuningJobs, Models, Adapters, Datasets, Deployments
-from entities import (
-    FineTuningJob, FineTuningJobType, Model, Adapter, Dataset, Deployment,
-    DatasetFormat, Hyperparameters, DeploymentStatus, DeploymentEnvironment
-)
-from typing import Dict, List, Optional, Any, Union
 import os
+import json
+from pathlib import Path
+from typing import Dict, List, Optional, Any, Union, Tuple
+from datetime import datetime
 from loguru import logger
+
+from managers import FineTuningJobManager, HubManager, CheckpointManager
+from entities import (
+    FineTuningJob, Model, Adapter, Hub, Checkpoint, 
+    Metrics, Event, File, ModelType, ModelOrigin,
+    FineTuningMethod, AdapterType, Hyperparameters
+)
 from utils import generate_uuid
+
+# Configure logger
+logger.add("logs/finetuning_{time:YYYY-MM-DD}.log", rotation="00:00", level="INFO")
+logger.add("logs/finetuning_errors.log", level="ERROR")
 
 class SDK:
     """
-    Main SDK for managing datasets, models, adapters, fine-tuning jobs and deployments.
+    Main SDK for fine-tuning models and managing the model hub.
     
     This SDK provides a unified interface to interact with all components
-    of the model training and deployment system.
+    of the fine-tuning system according to the specification in spec.md.
+    
+    It supports:
+    - Creation and management of fine-tuning jobs
+    - Management of models and adapters in the hub
+    - Tracking of checkpoints during training
     """   
-    def __init__(self, organization_id: str = None, project_id: str = None):
+    def __init__(self, organization_id: str = None):
         """
-        Initializes the SDK with the necessary resource managers.
+        Initialize the SDK with necessary resource managers.
         
         Args:
-            organization_id (str, optional): Organization ID to use for all created resources.
-            project_id (str, optional): Project ID to use for all created resources.
+            organization_id: Organization ID to use for all created resources
         """
         self.organization_id = organization_id or "default_org"
-        self.project_id = project_id or "default_project"
-        self.datasets = Datasets()
-        self.models = Models()
-        self.adapters = Adapters() 
-        self.fine_tuning_jobs = FineTuningJobs()
-        self.deployments = Deployments() 
-        logger.info("SDK successfully initialized")
-
-    # Datasets ---------------------------------------------------------------------------------------                        
-    def list_datasets(self) -> List[Dataset]:
-        """
-        Gets a list of all available datasets.
         
-        Returns:
-            List[Dataset]: List of available Dataset objects.
-        """
-        return self.datasets.list()
-
-    def create_dataset(self, 
-                    name: str, 
-                    path: str, 
-                    format: Union[Dict[str,Any],DatasetFormat]) -> Dataset:
-        """
-        Creates a new dataset from a file or directory.
-        
-        Args:
-            name (str): Unique name for the dataset.
-            path (str): Path to the file or directory containing the data.
-            format (Union[Dict[str, Any], DatasetFormat]): Format specification for the dataset.
-            
-        Returns:
-            Dataset: The created Dataset object.
-            
-        Raises:
-            ValueError: If a dataset with the same name already exists.
-            FileNotFoundError: If the specified path doesn't exist.
-        """        
-        self._validate_resource_doesnt_exist(self.datasets, name, "Dataset")
-        self._validate_path_exists(path)
-        
-        # Convert dict format to DatasetFormat if necessary
-        if isinstance(format, dict):
-            format = DatasetFormat(**format)
-        
-        dataset = Dataset(
-            id=generate_uuid(),
+        # Initialize managers
+        self.hub = HubManager(
             organization_id=self.organization_id,
-            project_id=self.project_id,
-            name=name,
-            path=path,
-            format=format
+            name="model_hub", 
+            path=str(Path("fine_tuning_data/hub"))
         )
-        self.datasets.create(dataset)
-        logger.success(f"Dataset '{name}' created successfully.")
-        return dataset
-    
-    def get_dataset(self, name: str) -> Dataset:
-        """
-        Gets a dataset by its name.
+        self.fine_tuning_jobs = FineTuningJobManager(organization_id=self.organization_id)
+        self.checkpoints = CheckpointManager()
         
-        Args:
-            name (str): Name of the dataset.
-            
-        Returns:
-            Dataset: The corresponding Dataset object.
-            
-        Raises:
-            ValueError: If the dataset doesn't exist.
-        """
-        return self._get_resource(self.datasets, name, "Dataset")
+        # Ensure directories exist
+        os.makedirs("fine_tuning_data/models", exist_ok=True)
+        os.makedirs("fine_tuning_data/adapters", exist_ok=True)
+        os.makedirs("fine_tuning_data/checkpoints", exist_ok=True)
+        
+        logger.info(f"SDK initialized for organization {self.organization_id}")
 
-    def delete_dataset(self, name: str) -> None:
+    # Hub Models ------------------------------------------------------------------------------------
+    def list_hub_models(self) -> List[Dict[str, Any]]:
         """
-        Deletes an existing dataset.
-        
-        Args:
-            name (str): Name of the dataset to delete.
-            
-        Raises:
-            ValueError: If the dataset doesn't exist.
-        """        
-        self._validate_resource_exists(self.datasets, name, "Dataset")
-        self.datasets.delete(name)
-        logger.success(f"Dataset '{name}' deleted successfully.")
-        
-    # Models -----------------------------------------------------------------------------------------
-    def list_models(self) -> List[Model]:
-        """
-        Gets a list of all available models.
+        Get a list of all models in the hub
         
         Returns:
-            List[Model]: List of available Model objects.
-        """        
-        return self.models.list()
-
-    def create_model(self, 
-                    name: str, 
-                    path: str, 
-                    dataset_id:str,
-                    base_model: Optional[str] = None,
-                    adapters: Optional[List[str]] = None,
-                    hyperparameters: Optional[Union[Dict[str,Any],Hyperparameters]] = None) -> Model:
+            List[Dict[str, Any]]: List of model summaries
         """
-        Creates a new model from a file or directory.
+        return self.hub.list_models()
+        
+    def get_hub_model(self, model_id_or_name: str) -> Optional[Model]:
+        """
+        Get a model from the hub by ID or name
         
         Args:
-            name (str): Unique name for the model.
-            path (str): Path to the file or directory containing the model.
-            dataset_id (str): ID or name of the dataset to use for training.
-            base_model (Optional[str]): Name or ID of the base model to use.
-            adapters (Optional[List[str]]): List of adapter names or IDs to apply.
-            hyperparameters (Optional[Union[Dict[str, Any], Hyperparameters]]): Hyperparameters for the model.
+            model_id_or_name: Model ID or name
             
         Returns:
-            Model: The created Model object.
+            Model: Model object if found
             
         Raises:
-            ValueError: If a model with the same name already exists.
-            FileNotFoundError: If the specified path doesn't exist.
-        """        
-        self._validate_resource_doesnt_exist(self.models, name, "Model")
-        self._validate_path_exists(path)
-        
-        # Get dataset object to extract its ID
-        dataset = self._get_resource(self.datasets, dataset_id, "Dataset")
-        
-        # Validate adapters if provided
-        adapter_ids = []
-        if adapters:
-            for adapter_name in adapters:
-                adapter = self._get_resource(self.adapters, adapter_name, "Adapter")
-                adapter_ids.append(adapter.id)
-        
-        # Convert dict hyperparameters to Hyperparameters if necessary
-        if isinstance(hyperparameters, dict):
-            hyperparameters = Hyperparameters(**hyperparameters)
-        elif hyperparameters is None:
-            hyperparameters = Hyperparameters()
-        
-        model = Model(
-            id=generate_uuid(),
-            organization_id=self.organization_id,
-            project_id=self.project_id,
-            name=name,
-            path=path,  # Using 'path' instead of 'model_path'
-            dataset_id=dataset.id,
-            base_model=base_model,
-            adapters=adapter_ids if adapter_ids else None,
-            hyperparameters=hyperparameters
-        )
-        self.models.create(model)
-        logger.success(f"Model '{name}' created successfully.")
+            ValueError: If model not found
+        """
+        model = self.hub.get_model(model_id_or_name)
+        if not model:
+            raise ValueError(f"Model '{model_id_or_name}' not found in hub")
         return model
-
-    def get_model(self, name: str) -> Model:
-        """
-        Gets a model by its name.
-        
-        Args:
-            name (str): Name of the model.
-            
-        Returns:
-            Model: The corresponding Model object.
-            
-        Raises:
-            ValueError: If the model doesn't exist.
-        """
-        return self._get_resource(self.models, name, "Model")    
     
-    def delete_model(self, name: str) -> None:
+    def create_hub_model(self, 
+                       name: str, 
+                       model_type: str, 
+                       path: str,
+                       description: Optional[str] = None,
+                       base_model_id: Optional[str] = None) -> Model:
         """
-        Deletes an existing model.
+        Register a new model in the hub
         
         Args:
-            name (str): Name of the model to delete.
-            
-        Raises:
-            ValueError: If the model doesn't exist.
-        """
-        self._validate_resource_exists(self.models, name, "Model")
-        self.models.delete(name)
-        logger.success(f"Model '{name}' deleted successfully.")
-    
-    # Adapters ---------------------------------------------------------------------------------------
-    def list_adapters(self) -> List[Adapter]:
-        """
-        Gets a list of all available adapters.
-        
-        Returns:
-            List[Adapter]: List of available Adapter objects.
-        """
-        return self.adapters.list()   
-
-    def create_adapter(self,
-                    name: str,
-                    model_id: str,
-                    dataset_id: str,
-                    adapter_type: str,
-                    path: str,
-                    hyperparameters: Optional[Union[Dict[str, Any], Hyperparameters]] = None) -> Adapter:
-        """
-        Creates a new adapter.
-        
-        Args:
-            name (str): Unique name for the adapter.
-            model_id (str): ID or name of the model this adapter is for.
-            dataset_id (str): ID or name of the dataset used to train this adapter.
-            adapter_type (str): Type of adapter (e.g., "lora", "qlora").
-            path (str): Path to store the adapter.
-            hyperparameters (Optional[Union[Dict[str, Any], Hyperparameters]]): Adapter hyperparameters.
+            name: Name for the model
+            model_type: Type of model (base or fine-tuned)
+            path: Path to model files
+            description: Optional description
+            base_model_id: Base model ID for fine-tuned models
             
         Returns:
-            Adapter: The created Adapter object.
+            Model: The created model
             
         Raises:
-            ValueError: If an adapter with the same name already exists.
+            ValueError: If model with same name exists
+            FileNotFoundError: If path doesn't exist
         """
-        self._validate_resource_doesnt_exist(self.adapters, name, "Adapter")
-        
-        # Get model object to extract its ID
-        model = self._get_resource(self.models, model_id, "Model")
-        
-        # Get dataset object to extract its ID
-        dataset = self._get_resource(self.datasets, dataset_id, "Dataset")
-        
-        # Convert dict hyperparameters to Hyperparameters if necessary
-        if isinstance(hyperparameters, dict):
-            hyperparameters = Hyperparameters(**hyperparameters)
-        elif hyperparameters is None:
-            hyperparameters = Hyperparameters()
-            
-        adapter = Adapter(
-            id=generate_uuid(),
-            organization_id=self.organization_id,
-            project_id=self.project_id,
-            name=name,
-            base_model_id=model.id,  # Using 'base_model_id' instead of 'model_id'
-            dataset_id=dataset.id,
-            type=adapter_type,
-            path=path,
-            hyperparameters=hyperparameters
-        )
-        self.adapters.create(adapter)
-        logger.success(f"Adapter '{name}' created successfully.")
-        return adapter    
-    
-    def get_adapter(self, name: str) -> Adapter:
-        """
-        Gets an adapter by its name.
-        
-        Args:
-            name (str): Name of the adapter.
-            
-        Returns:
-            Adapter: The corresponding Adapter object.
-            
-        Raises:
-            ValueError: If the adapter doesn't exist.
-        """
-        return self._get_resource(self.adapters, name, "Adapter")        
-    
-    def delete_adapter(self, name: str) -> None:
-        """
-        Deletes an existing adapter.
-        
-        Args:
-            name (str): Name of the adapter to delete.
-            
-        Raises:
-            ValueError: If the adapter doesn't exist.
-        """
-        self._validate_resource_exists(self.adapters, name, "Adapter")
-        self.adapters.delete(name)
-        logger.success(f"Adapter '{name}' deleted successfully.")
-    
-    # Deployments ------------------------------------------------------------------------------------
-    def list_deployments(self) -> List[Deployment]:
-        """
-        Gets a list of all active deployments.
-        
-        Returns:
-            List[Deployment]: List of active Deployment objects.
-        """
-        return self.deployments.list()
-        
-    def deploy(self, 
-                model_name: str, 
-                deployment_name: Optional[str] = None,
-                adapters: Optional[List[str]] = None,
-                merge: bool = False,
-                environment: str = "development") -> Deployment:
-        """
-        Deploys a model with optional adapters.
-        
-        Args:
-            model_name (str): Name of the model to deploy.
-            deployment_name (Optional[str]): Custom name for the deployment.
-            adapters (Optional[List[str]]): List of adapter names to apply.
-            merge (bool): Whether to merge adapters with the model.
-            environment (str): Deployment environment ("development", "staging", "production").            
-            
-        Returns:
-            Deployment: The created Deployment object.
-            
-        Raises:
-            ValueError: If the model doesn't exist or any adapter doesn't exist.
-        """
-        # Get model object to extract its ID
-        model = self._get_resource(self.models, model_name, "Model")
-        
-        # Validate adapters
-        adapter_ids = []
-        if adapters:
-            for adapter_name in adapters:
-                adapter = self._get_resource(self.adapters, adapter_name, "Adapter")
-                adapter_ids.append(adapter.id)
-                
-        # Create deployment name if not exists
-        if not deployment_name:
-            deployment_name = f"{model_name}-deployment"
-        
-        
-        # Check if deployment with this name already exists
-        self._validate_resource_doesnt_exist(self.deployments, deployment_name, "Deployment")
-
-        # Create deployment
-        deployment = Deployment(
-            id=generate_uuid(),
-            organization_id=self.organization_id,
-            project_id=self.project_id,
-            name=deployment_name,
-            base_model_id=model.id,
-            adapters_id=adapter_ids if adapter_ids else None,
-            status=DeploymentStatus.PENDING,
-            environment=DeploymentEnvironment(environment),
-            merge=merge
-        )
-        
-        self.deployments.create(deployment)
-        # Trigger deployment process
-        self.deployments.deploy(deployment_name)
-        
-        logger.success(f"Model '{model_name}' deployed successfully as '{deployment_name}'.")
-        return deployment
-    
-    def get_deployment(self, name: str) -> Deployment:
-        """
-        Gets a deployment by its name.
-        
-        Args:
-            name (str): Name of the deployment.
-            
-        Returns:
-            Deployment: The corresponding Deployment object.
-            
-        Raises:
-            ValueError: If the deployment doesn't exist.
-        """
-        return self._get_resource(self.deployments, name, "Deployment")
-    
-    def undeploy(self, deployment_name: str) -> None:
-        """
-        Deactivates and removes an existing deployment.
-        
-        Args:
-            deployment_name (str): Name of the deployment to remove.
-            
-        Raises:
-            ValueError: If the deployment doesn't exist.
-        """        
-        self._validate_resource_exists(self.deployments, deployment_name, "Deployment")
-        self.deployments.undeploy(deployment_name)
-        logger.success(f"Deployment '{deployment_name}' undeployed successfully.")
-        
-    # Fine-tuning jobs --------------------------------------------------------------------------------    
-    def list_fine_tuning_jobs(self) -> List[FineTuningJob]:
-        """
-        Gets a list of all available fine-tuning
-        jobs.
-
-        Returns:
-            List[FineTuningJob]: List of available FineTuningJob objects.
-        """
-        return self.fine_tuning_jobs.list()
-    
-    def create_fine_tuning_job(self, 
-                            job_name: str,
-                            base_model: str,
-                            dataset: str,
-                            job_type: str = "sft",
-                            hyperparameters: Optional[Union[Dict[str, Any], Hyperparameters]] = None) -> FineTuningJob:        
-        """
-        Creates and prepares a fine-tuning job.
-        
-        Args:
-            job_name (str): Unique name for the job.
-            base_model (str): Name or ID of the base model to fine-tune.
-            dataset (str): Name or ID of the dataset to use.
-            job_type (str): Type of fine-tuning job ("sft", "lora", "qlora", etc.).
-            hyperparameters (Optional[Union[Dict[str, Any], Hyperparameters]]): Job hyperparameters.
-                        
-        Returns:
-            FineTuningJob: The created fine-tuning job object.
-            
-        Raises:
-            ValueError: If a job with the same name already exists or if the base model or dataset don't exist.
-        """       
-        self._validate_resource_doesnt_exist(self.fine_tuning_jobs, job_name, "Fine tuning job")
-        
-        # Get model object to extract its ID/name
-        base_model_obj = self._get_resource(self.models, base_model, "Base model")
-        
-        # Get dataset object to extract its ID
-        dataset_obj = self._get_resource(self.datasets, dataset, "Dataset")
-        
-        # Convert dict hyperparameters to Hyperparameters if necessary
-        if isinstance(hyperparameters, dict):
-            hyperparameters = Hyperparameters(**hyperparameters)
-        elif hyperparameters is None:
-            hyperparameters = Hyperparameters()
-
-        job = FineTuningJob(
-            id=generate_uuid(),
-            organization_id=self.organization_id,
-            project_id=self.project_id,
-            name=job_name,
-            base_model=base_model_obj.name,  # Use name for better readability
-            dataset_id=dataset_obj.id,
-            job_type=FineTuningJobType(job_type),
-            hyperparameters=hyperparameters
-        )
-        self.fine_tuning_jobs.create(job)   
-        logger.success(f"Fine tuning job '{job_name}' created successfully.")     
-        
-        return job
-    
-
-    def get_fine_tuning_job(self, job_name: str) -> FineTuningJob:
-        """
-        Gets a fine-tuning job by its name.
-        
-        Args:
-            job_name (str): Name of the job.
-            
-        Returns:
-            FineTuningJob: The corresponding FineTuningJob object.
-            
-        Raises:
-            ValueError: If the job doesn't exist.
-        """        
-        return self._get_resource(self.fine_tuning_jobs, job_name, "Fine tuning job")
-        
-    def cancel_fine_tuning_job(self, job_name: str) -> None:
-        """
-        Cancels a running or pending fine-tuning job.
-        
-        Args:
-            job_name (str): Name of the job to cancel.
-            
-        Raises:
-            ValueError: If the job doesn't exist.
-        """
-        job = self._get_resource(self.fine_tuning_jobs, job_name, "Fine tuning job")
-        success = job.cancel()
-        if success:
-            self.fine_tuning_jobs.update(job)
-            logger.success(f"Fine tuning job '{job_name}' cancelled successfully.")
-        else:
-            logger.warning(f"Fine tuning job '{job_name}' could not be cancelled. Current status: {job.status}")
-
-    def pause_fine_tuning_job(self, job_name: str) -> None:
-        """
-        Pauses a running fine-tuning job.
-        
-        Args:
-            job_name (str): Name of the job to pause.
-            
-        Raises:
-            ValueError: If the job doesn't exist.
-        """
-        job = self._get_resource(self.fine_tuning_jobs, job_name, "Fine tuning job")
-        success = job.pause()
-        if success:
-            self.fine_tuning_jobs.update(job)
-            logger.success(f"Fine tuning job '{job_name}' paused successfully.")
-        else:
-            logger.warning(f"Fine tuning job '{job_name}' could not be paused. Current status: {job.status}")
-            
-    def resume_fine_tuning_job(self, job_name: str) -> None:
-        """
-        Resumes a paused fine-tuning job.
-        
-        Args:
-            job_name (str): Name of the job to resume.
-            
-        Raises:
-            ValueError: If the job doesn't exist.
-        """
-        job = self._get_resource(self.fine_tuning_jobs, job_name, "Fine tuning job")
-        success = job.resume()
-        if success:
-            self.fine_tuning_jobs.update(job)
-            logger.success(f"Fine tuning job '{job_name}' resumed successfully.")
-        else:
-            logger.warning(f"Fine tuning job '{job_name}' could not be resumed. Current status: {job.status}")
-
-# Helper methods --------------------------------------------------------------------------------
-    def _validate_resource_exists(self, manager, resource_name: str, resource_type: str) -> None:
-        """Validates that a resource exists"""
-        if not manager.contains(resource_name):
-            logger.error(f"{resource_type} '{resource_name}' not found")
-            raise ValueError(f"{resource_type} '{resource_name}' not found")
-            
-    def _validate_resource_doesnt_exist(self, manager, resource_name: str, resource_type: str) -> None:
-        """Validates that a resource doesn't exist"""
-        if manager.contains(resource_name):
-            logger.error(f"{resource_type} '{resource_name}' already exists")
-            raise ValueError(f"{resource_type} '{resource_name}' already exists")
-            
-    def _validate_path_exists(self, path: str) -> None:
-        """Validates that a path exists"""
+        # Validate path exists
         if not os.path.exists(path):
-            logger.error(f"Path not found: {path}")
             raise FileNotFoundError(f"Path not found: {path}")
             
-    def _get_resource(self, manager, resource_name: str, resource_type: str) -> Any:
-        """Gets a resource, raising a ValueError if it doesn't exist"""
-        self._validate_resource_exists(manager, resource_name, resource_type)
-        resource = manager.get(resource_name)
-        if not resource:
-            logger.error(f"{resource_type} '{resource_name}' not found")
-            raise ValueError(f"{resource_type} '{resource_name}' not found")
-        return resource
+        # Create model object
+        model = Model(
+            organization_id=self.organization_id,
+            name=name,
+            type=ModelType(model_type),
+            origin=ModelOrigin.LOCAL,
+            path=path,
+            description=description,
+            base_model_id=base_model_id,
+            created_at=datetime.utcnow()
+        )
+        
+        # Register in hub
+        model_id = self.hub.create_model(model)
+        if not model_id:
+            raise ValueError(f"Failed to register model '{name}' in hub")
+            
+        logger.success(f"Model '{name}' registered in hub")
+        return model
+    
+    def delete_hub_model(self, model_id_or_name: str) -> bool:
+        """
+        Remove a model from the hub
+        
+        Args:
+            model_id_or_name: Model ID or name
+            
+        Returns:
+            bool: True if deleted successfully
+            
+        Raises:
+            ValueError: If model not found
+        """
+        if not self.hub.delete_model(model_id_or_name):
+            raise ValueError(f"Failed to delete model '{model_id_or_name}' from hub")
+            
+        logger.success(f"Model '{model_id_or_name}' removed from hub")
+        return True
+        
+    # Hub Adapters ----------------------------------------------------------------------------------
+    def list_hub_adapters(self) -> List[Dict[str, Any]]:
+        """
+        Get a list of all adapters in the hub
+        
+        Returns:
+            List[Dict[str, Any]]: List of adapter summaries
+        """
+        return self.hub.list_adapters()
+        
+    def get_hub_adapter(self, adapter_id_or_name: str) -> Optional[Adapter]:
+        """
+        Get an adapter from the hub by ID or name
+        
+        Args:
+            adapter_id_or_name: Adapter ID or name
+            
+        Returns:
+            Adapter: Adapter object if found
+            
+        Raises:
+            ValueError: If adapter not found
+        """
+        adapter = self.hub.get_adapter(adapter_id_or_name)
+        if not adapter:
+            raise ValueError(f"Adapter '{adapter_id_or_name}' not found in hub")
+        return adapter
+    
+    def create_hub_adapter(self, 
+                         name: str,
+                         adapter_type: str,
+                         model_id: str,
+                         dataset: str,
+                         path: str,
+                         description: Optional[str] = None,
+                         hyperparameters: Optional[Dict[str, Any]] = None) -> Adapter:
+        """
+        Register a new adapter in the hub
+        
+        Args:
+            name: Name for the adapter
+            adapter_type: Type of adapter (lora or qlora)
+            model_id: ID or name of the associated model
+            dataset: Dataset used for training
+            path: Path to adapter files
+            description: Optional description
+            hyperparameters: Optional training hyperparameters
+            
+        Returns:
+            Adapter: The created adapter
+            
+        Raises:
+            ValueError: If adapter with same name exists
+            FileNotFoundError: If path doesn't exist
+        """
+        # Validate path exists
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Path not found: {path}")
+            
+        # Validate model exists
+        model = self.hub.get_model(model_id)
+        if not model:
+            raise ValueError(f"Model '{model_id}' not found in hub")
+            
+        # Validate dataset exists
+        if not os.path.exists(dataset):
+            raise FileNotFoundError(f"Dataset not found: {dataset}")
+        
+        # Create hyperparameters object if provided
+        hp = Hyperparameters()
+        if hyperparameters:
+            hp = Hyperparameters(
+                method=FineTuningMethod(adapter_type),
+                **hyperparameters
+            )
+        else:
+            hp = Hyperparameters(method=FineTuningMethod(adapter_type))
+        
+        # Create adapter object
+        adapter = Adapter(
+            organization_id=self.organization_id,
+            name=name,
+            adapter_type=AdapterType(adapter_type),
+            model_id=model.id,
+            dataset=dataset,
+            path=path,
+            hyperparameters=hp,
+            created_at=datetime.utcnow()
+        )
+        
+        # Register in hub
+        adapter_id = self.hub.create_adapter(adapter)
+        if not adapter_id:
+            raise ValueError(f"Failed to register adapter '{name}' in hub")
+            
+        logger.success(f"Adapter '{name}' registered in hub")
+        return adapter
+    
+    def delete_hub_adapter(self, adapter_id_or_name: str) -> bool:
+        """
+        Remove an adapter from the hub
+        
+        Args:
+            adapter_id_or_name: Adapter ID or name
+            
+        Returns:
+            bool: True if deleted successfully
+            
+        Raises:
+            ValueError: If adapter not found
+        """
+        if not self.hub.delete_adapter(adapter_id_or_name):
+            raise ValueError(f"Failed to delete adapter '{adapter_id_or_name}' from hub")
+            
+        logger.success(f"Adapter '{adapter_id_or_name}' removed from hub")
+        return True
+    
+    # Fine-tuning Jobs -------------------------------------------------------------------------------
+    def list_fine_tuning_jobs(self) -> List[Dict[str, Any]]:
+        """
+        List all fine-tuning jobs
+        
+        Returns:
+            List[Dict[str, Any]]: List of job summaries
+        """
+        return self.fine_tuning_jobs.list()
+        
+    def get_fine_tuning_job(self, job_id_or_name: str) -> FineTuningJob:
+        """
+        Get a fine-tuning job by ID or name
+        
+        Args:
+            job_id_or_name: Job ID or name
+            
+        Returns:
+            FineTuningJob: The fine-tuning job
+            
+        Raises:
+            ValueError: If job not found
+        """
+        job = self.fine_tuning_jobs.get(job_id_or_name)
+        if not job:
+            raise ValueError(f"Fine-tuning job '{job_id_or_name}' not found")
+        return job
+        
+    def create_fine_tuning_job(self,
+                             name: str,
+                             base_model: str,
+                             dataset: str,
+                             val_dataset: Optional[str] = None,
+                             job_type: str = "sft",
+                             output_model_name: Optional[str] = None,
+                             hyperparameters: Optional[Dict[str, Any]] = None) -> FineTuningJob:
+        """
+        Create a new fine-tuning job
+        
+        Args:
+            name: Unique name for the job
+            base_model: Name or path of base model to fine-tune
+            dataset: Path to training dataset
+            val_dataset: Optional path to validation dataset
+            job_type: Type of fine-tuning (sft, lora, qlora)
+            output_model_name: Optional name for output model
+            hyperparameters: Optional hyperparameters for training
+            
+        Returns:
+            FineTuningJob: The created fine-tuning job
+            
+        Raises:
+            ValueError: If job with same name exists
+            FileNotFoundError: If dataset doesn't exist
+        """
+        # Validate paths
+        if not os.path.exists(dataset):
+            raise FileNotFoundError(f"Training dataset not found: {dataset}")
+            
+        if val_dataset and not os.path.exists(val_dataset):
+            raise FileNotFoundError(f"Validation dataset not found: {val_dataset}")
+            
+        # Check if base_model is a path or name in hub
+        if os.path.exists(base_model):
+            base_model_path = base_model
+        else:
+            # Try to get from hub
+            try:
+                model = self.hub.get_model(base_model)
+                base_model_path = model.get_full_path()
+            except:
+                raise ValueError(f"Base model '{base_model}' not found in hub or filesystem")
+        
+        # Create hyperparameters object
+        hp = Hyperparameters(method=FineTuningMethod(job_type))
+        if hyperparameters:
+            # Update default hyperparameters with user values
+            for key, value in hyperparameters.items():
+                setattr(hp, key, value)
+                
+        # Output paths setup
+        logs_path = f"logs/{name}"
+        os.makedirs(logs_path, exist_ok=True)
+        
+        # Create output model name if not provided
+        if not output_model_name:
+            output_model_name = f"{name}-model"
+            
+        # Create job object
+        job = FineTuningJob(
+            name=name,
+            organization_id=self.organization_id,
+            base_model=base_model_path,
+            dataset=dataset,
+            val_dataset=val_dataset,
+            hyperparameters=hp,
+            logs_path=logs_path,
+            description=f"Fine-tuning job for {output_model_name}"
+        )
+        
+        # Register job
+        job_id = self.fine_tuning_jobs.create(job)
+        if not job_id:
+            raise ValueError(f"Failed to create fine-tuning job '{name}'")
+            
+        logger.success(f"Fine-tuning job '{name}' created successfully")
+        return job
+        
+    def start_fine_tuning_job(self, job_id_or_name: str) -> bool:
+        """
+        Start a fine-tuning job
+        
+        Args:
+            job_id_or_name: Job ID or name
+            
+        Returns:
+            bool: True if started successfully
+            
+        Raises:
+            ValueError: If job not found or cannot be started
+        """
+        if not self.fine_tuning_jobs.start_job(job_id_or_name):
+            raise ValueError(f"Failed to start fine-tuning job '{job_id_or_name}'")
+            
+        logger.success(f"Fine-tuning job '{job_id_or_name}' started")
+        return True
+        
+    def pause_fine_tuning_job(self, job_id_or_name: str) -> bool:
+        """
+        Pause a running fine-tuning job
+        
+        Args:
+            job_id_or_name: Job ID or name
+            
+        Returns:
+            bool: True if paused successfully
+            
+        Raises:
+            ValueError: If job not found or cannot be paused
+        """
+        if not self.fine_tuning_jobs.pause_job(job_id_or_name):
+            raise ValueError(f"Failed to pause fine-tuning job '{job_id_or_name}'")
+            
+        logger.success(f"Fine-tuning job '{job_id_or_name}' paused")
+        return True
+        
+    def resume_fine_tuning_job(self, job_id_or_name: str) -> bool:
+        """
+        Resume a paused fine-tuning job
+        
+        Args:
+            job_id_or_name: Job ID or name
+            
+        Returns:
+            bool: True if resumed successfully
+            
+        Raises:
+            ValueError: If job not found or cannot be resumed
+        """
+        if not self.fine_tuning_jobs.resume_job(job_id_or_name):
+            raise ValueError(f"Failed to resume fine-tuning job '{job_id_or_name}'")
+            
+        logger.success(f"Fine-tuning job '{job_id_or_name}' resumed")
+        return True
+        
+    def cancel_fine_tuning_job(self, job_id_or_name: str) -> bool:
+        """
+        Cancel a fine-tuning job
+        
+        Args:
+            job_id_or_name: Job ID or name
+            
+        Returns:
+            bool: True if canceled successfully
+            
+        Raises:
+            ValueError: If job not found or cannot be canceled
+        """
+        if not self.fine_tuning_jobs.cancel_job(job_id_or_name):
+            raise ValueError(f"Failed to cancel fine-tuning job '{job_id_or_name}'")
+            
+        logger.success(f"Fine-tuning job '{job_id_or_name}' canceled")
+        return True
+        
+    def delete_fine_tuning_job(self, job_id_or_name: str) -> bool:
+        """
+        Delete a fine-tuning job
+        
+        Args:
+            job_id_or_name: Job ID or name
+            
+        Returns:
+            bool: True if deleted successfully
+            
+        Raises:
+            ValueError: If job not found
+        """
+        if not self.fine_tuning_jobs.delete(job_id_or_name):
+            raise ValueError(f"Failed to delete fine-tuning job '{job_id_or_name}'")
+            
+        # Also delete associated checkpoints
+        job = self.fine_tuning_jobs.get(job_id_or_name)
+        if job:
+            self.checkpoints.delete_by_job(job.id)
+            
+        logger.success(f"Fine-tuning job '{job_id_or_name}' deleted")
+        return True
+    
+    # Checkpoints ------------------------------------------------------------------------------------
+    def list_checkpoints(self, job_id_or_name: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        List checkpoints, optionally filtered by job
+        
+        Args:
+            job_id_or_name: Optional job ID or name to filter by
+            
+        Returns:
+            List[Dict[str, Any]]: List of checkpoint summaries
+        """
+        if job_id_or_name:
+            # Get job first
+            job = self.fine_tuning_jobs.get(job_id_or_name)
+            if not job:
+                raise ValueError(f"Fine-tuning job '{job_id_or_name}' not found")
+                
+            # Get checkpoints for this job
+            checkpoints = self.checkpoints.get_by_job(job.id)
+            return [checkpoint.get_info() for checkpoint in checkpoints]
+        else:
+            # Return all checkpoints
+            return [checkpoint.get_info() for checkpoint in self.checkpoints.checkpoints.values()]
+            
+    def get_checkpoint(self, checkpoint_id: str) -> Checkpoint:
+        """
+        Get a checkpoint by ID
+        
+        Args:
+            checkpoint_id: Checkpoint ID
+            
+        Returns:
+            Checkpoint: The checkpoint
+            
+        Raises:
+            ValueError: If checkpoint not found
+        """
+        checkpoint = self.checkpoints.get(checkpoint_id)
+        if not checkpoint:
+            raise ValueError(f"Checkpoint '{checkpoint_id}' not found")
+        return checkpoint
+        
+    def get_latest_checkpoint(self, job_id_or_name: str) -> Optional[Checkpoint]:
+        """
+        Get the latest checkpoint for a job
+        
+        Args:
+            job_id_or_name: Job ID or name
+            
+        Returns:
+            Optional[Checkpoint]: Latest checkpoint if found
+            
+        Raises:
+            ValueError: If job not found
+        """
+        # Get job first
+        job = self.fine_tuning_jobs.get(job_id_or_name)
+        if not job:
+            raise ValueError(f"Fine-tuning job '{job_id_or_name}' not found")
+            
+        # Get latest checkpoint
+        return self.checkpoints.get_latest_by_job(job.id)
+        
+    def create_checkpoint(self, 
+                        job_id_or_name: str, 
+                        step_number: int, 
+                        path: str,
+                        metrics: Optional[Dict[str, float]] = None) -> Checkpoint:
+        """
+        Create a new checkpoint for a job
+        
+        Args:
+            job_id_or_name: Job ID or name
+            step_number: Training step number
+            path: Path to checkpoint files
+            metrics: Optional metrics (train_loss, valid_loss)
+            
+        Returns:
+            Checkpoint: The created checkpoint
+            
+        Raises:
+            ValueError: If job not found
+            FileNotFoundError: If path doesn't exist
+        """
+        # Validate path exists
+        if not os.path.exists(path):
+            # Create the directory if it doesn't exist
+            os.makedirs(path, exist_ok=True)
+            
+        # Get job first
+        job = self.fine_tuning_jobs.get(job_id_or_name)
+        if not job:
+            raise ValueError(f"Fine-tuning job '{job_id_or_name}' not found")
+            
+        # Create metrics object
+        checkpoint_metrics = Metrics()
+        if metrics:
+            if 'train_loss' in metrics:
+                checkpoint_metrics.train_loss = metrics['train_loss']
+            if 'valid_loss' in metrics:
+                checkpoint_metrics.valid_loss = metrics['valid_loss']
+                
+        # Create checkpoint
+        checkpoint = Checkpoint(
+            job_id=job.id,
+            step_number=step_number,
+            path=path,
+            metrics=checkpoint_metrics,
+            created_at=datetime.utcnow()
+        )
+        
+        # Register checkpoint
+        checkpoint_id = self.checkpoints.create(checkpoint)
+        
+        # Add to job
+        job.add_checkpoint(checkpoint)
+        self.fine_tuning_jobs.update(job)
+        
+        logger.success(f"Checkpoint created for job '{job.name}' at step {step_number}")
+        return checkpoint
+        
+    def delete_checkpoint(self, checkpoint_id: str) -> bool:
+        """
+        Delete a checkpoint
+        
+        Args:
+            checkpoint_id: Checkpoint ID
+            
+        Returns:
+            bool: True if deleted successfully
+            
+        Raises:
+            ValueError: If checkpoint not found
+        """
+        checkpoint = self.checkpoints.get(checkpoint_id)
+        if not checkpoint:
+            raise ValueError(f"Checkpoint '{checkpoint_id}' not found")
+            
+        # Get the job and update it
+        job = self.fine_tuning_jobs.get(checkpoint.job_id)
+        if job:
+            # Update job checkpoints list
+            job.checkpoints = [c for c in job.checkpoints if c != checkpoint_id]
+            self.fine_tuning_jobs.update(job)
+            
+        # Delete checkpoint
+        if not self.checkpoints.delete(checkpoint_id):
+            raise ValueError(f"Failed to delete checkpoint '{checkpoint_id}'")
+            
+        logger.success(f"Checkpoint '{checkpoint_id}' deleted")
+        return True
+        
+    # Utility Methods ----------------------------------------------------------------------------------
+    def register_fine_tuning_results(self, 
+                                   job_id_or_name: str, 
+                                   model_name: Optional[str] = None,
+                                   adapter_name: Optional[str] = None) -> Dict[str, str]:
+        """
+        Register fine-tuning results (model and/or adapter) in the hub
+        
+        Args:
+            job_id_or_name: Job ID or name
+            model_name: Optional name for the model
+            adapter_name: Optional name for the adapter
+            
+        Returns:
+            Dict[str, str]: Dictionary with model_id and/or adapter_id
+            
+        Raises:
+            ValueError: If job not found or not completed
+        """
+        # Get job
+        job = self.fine_tuning_jobs.get(job_id_or_name)
+        if not job:
+            raise ValueError(f"Fine-tuning job '{job_id_or_name}' not found")
+            
+        # Check if job is completed
+        if not job.is_complete or job.status != 'succeeded':
+            raise ValueError(f"Fine-tuning job '{job_id_or_name}' is not completed successfully")
+            
+        results = {}
+        
+        # Create model if needed
+        if model_name:
+            # Create model directory in hub
+            model_path = f"fine_tuning_data/models/{model_name}"
+            os.makedirs(model_path, exist_ok=True)
+            
+            # Create model in hub
+            model = Model(
+                organization_id=self.organization_id,
+                name=model_name,
+                type=ModelType.FINE_TUNED,
+                origin=ModelOrigin.LOCAL,
+                path=model_path,
+                description=f"Fine-tuned model from job {job.name}",
+                base_model_id=job.base_model,
+                hyperparameters=job.hyperparameters,
+                created_at=datetime.utcnow()
+            )
+            
+            # Add result files to model
+            for result_file in job.result_files:
+                if os.path.exists(result_file):
+                    # Copy or link the file to model directory
+                    pass
+                    
+            # Register in hub
+            model_id = self.hub.create_model(model)
+            if model_id:
+                results["model_id"] = model_id
+                job.output_model_id = model_id
+                self.fine_tuning_jobs.update(job)
+        
+        # Create adapter if job used PEFT (LoRA/QLoRA)
+        if adapter_name and job.is_peft:
+            # Create adapter directory in hub
+            adapter_path = f"fine_tuning_data/adapters/{adapter_name}"
+            os.makedirs(adapter_path, exist_ok=True)
+            
+            # Create adapter in hub
+            adapter = Adapter(
+                organization_id=self.organization_id,
+                name=adapter_name,
+                adapter_type=AdapterType(job.method),
+                model_id=job.base_model,
+                dataset=job.dataset,
+                path=adapter_path,
+                hyperparameters=job.hyperparameters,
+                created_at=datetime.utcnow()
+            )
+            
+            # Add result files to adapter
+            for result_file in job.result_files:
+                if os.path.exists(result_file) and "adapter" in result_file.lower():
+                    # Copy or link the file to adapter directory
+                    pass
+                    
+            # Register in hub
+            adapter_id = self.hub.create_adapter(adapter)
+            if adapter_id:
+                results["adapter_id"] = adapter_id
+                job.output_adapter_id = adapter_id
+                self.fine_tuning_jobs.update(job)
+        
+        return results
 
 
